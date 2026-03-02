@@ -1,34 +1,42 @@
 import os
-import asyncio
+import sys
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-SESSION_STRING = os.getenv("SESSION_STRING", "")  # <-- add this in Railway vars
+REQUIRED_VARS = ["API_ID", "API_HASH", "SESSION_STRING", "SOURCE_CHAT", "DEST_CHAT"]
 
-SOURCE_CHAT = os.getenv("SOURCE_CHAT", "")        # e.g. @Intellectia_Bot or chat id
-DEST_CHAT = os.getenv("DEST_CHAT", "")            # e.g. @IntellectiaDT
+def getenv_required(name: str) -> str:
+    val = os.getenv(name)
+    if not val:
+        raise RuntimeError(f"Missing required env var: {name}")
+    return val
 
-if not (API_ID and API_HASH and SESSION_STRING and SOURCE_CHAT and DEST_CHAT):
-    raise SystemExit("Missing required env vars: API_ID, API_HASH, SESSION_STRING, SOURCE_CHAT, DEST_CHAT")
+def main():
+    missing = [v for v in REQUIRED_VARS if not os.getenv(v)]
+    if missing:
+        print(f"Missing required env vars: {', '.join(missing)}")
+        sys.exit(1)
 
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    api_id = int(getenv_required("API_ID"))
+    api_hash = getenv_required("API_HASH")
+    session_string = getenv_required("SESSION_STRING")
+    source_chat = getenv_required("SOURCE_CHAT")   # e.g. "@Intellectia_Bot"
+    dest_chat = getenv_required("DEST_CHAT")       # e.g. "@IntellectiaDT"
 
-@client.on(events.NewMessage(chats=SOURCE_CHAT))
-async def handler(event):
-    try:
-        await client.forward_messages(DEST_CHAT, event.message)
-        text_preview = (event.raw_text or "")[:120].replace("\n", " ")
-        print(f"[FORWARDED] {SOURCE_CHAT} -> {DEST_CHAT} | {text_preview}")
-    except Exception as e:
-        print("[ERROR] Forward failed:", repr(e))
+    client = TelegramClient(StringSession(session_string), api_id, api_hash)
 
-async def main():
-    await client.start()
-    me = await client.get_me()
-    print(f"Userbot running as @{me.username or me.id}")
-    await client.run_until_disconnected()
+    @client.on(events.NewMessage(chats=source_chat))
+    async def handler(event):
+        try:
+            # Forward the exact message (preserves "Forwarded from" and media)
+            await client.forward_messages(dest_chat, event.message)
+            preview = (event.raw_text or "").replace("\n", " ")[:120]
+            print(f"[FORWARDED] {source_chat} -> {dest_chat} | {preview}")
+        except Exception as e:
+            print(f"[ERROR] forward failed: {e}")
+
+    print(f"[BOOT] Listening on {source_chat} and forwarding to {dest_chat}")
+    client.run_until_disconnected()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
