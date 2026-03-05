@@ -1,178 +1,126 @@
 import os
-import sys
 import asyncio
-import logging
-from typing import Optional, Tuple, Union
-
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
-# ----------------------------
-# Logging
-# ----------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-log = logging.getLogger("userbot-forwarder")
 
-
-# ----------------------------
-# Helpers
-# ----------------------------
-def env_required(name: str) -> str:
-    val = os.getenv(name)
+def require_env(name: str) -> str:
+    val = os.getenv(name, "").strip()
     if not val:
-        raise RuntimeError(f"Missing required env var: {name}")
-    return val.strip()
+        raise RuntimeError(f"Missing env var {name}")
+    return val
 
 
-def parse_chat_ref(raw: str) -> Union[int, str]:
+def parse_chat_ref(raw: str):
     """
     Accepts:
-      - "-100123..." (channel id)
-      - "123456"     (user/chat id)
-      - "@username"
-      - "username"
-    Returns int for numeric, otherwise string username without @.
+      - @username
+      - username
+      - numeric id like -100123...
+      - numeric id like 12345
+    Returns either int (for ids) or str (for usernames).
     """
     s = raw.strip()
-    if s.startswith("@"):
-        s = s[1:]
+    if not s:
+        raise ValueError("Empty chat ref")
 
-    # numeric?
+    # If it's numeric (possibly negative), treat as id
     try:
+        # int("-100...") works; int("100...") works
         return int(s)
     except ValueError:
-        return s  # username
+        pass
+
+    # Otherwise treat as username (strip leading @ if provided)
+    return s[1:] if s.startswith("@") else s
 
 
-async def build_dialog_index(client: TelegramClient) -> dict:
+async def resolve_entity(client: TelegramClient, chat_ref, label: str):
     """
-    Build a map of:
-      - id -> dialog
-      - username -> dialog (if present)
-      - title/name -> dialog (best-effort)
+    Resolves a chat/entity from either:
+      - id (int)
+      - username (str)
+    Strategy:
+      1) preload dialogs
+      2) try match by dialog id if int
+      3) fallback to get_entity
     """
-    idx = {}
-    async for d in client.iter_dialogs():
-        # By id
-        idx[str(d.id)] = d
+    # Preload dialogs to populate the entity cache
+    dialogs = await client.get_dialogs(limit=200)
 
-        # By username if exists
-        ent = d.entity
-        username = getattr(ent, "username", None)
-        if username:
-            idx[username.lower()] = d
+    # If it's an id, try direct match in dialogs first
+    if isinstance(chat_ref, int):
+        for d in dialogs:
+            if d.id == chat_ref:
+                print(f"[RESOLVE] {label} matched dialog cache: name='{d.name}' id={d.id}")
+                return d.entity
 
-        # By title/name (best-effort, not unique)
-        title = (d.name or "").strip()
-        if title:
-            idx[title.lower()] = d
+        # Fallback: ask Telegram for it
+        try:
+            ent = await client.get_entity(chat_ref)
+            print(f"[RESOLVE] {label} resolved via get_entity(id): id={chat_ref}")
+            return ent
+        except Exception as e:
+            raise RuntimeError(
+                f"[RESOLVE-FAIL] Could not resolve {label} by id={chat_ref}. "
+                f"Make sure the account in SESSION_STRING is a member of that chat/channel. "
+                f"Original error: {e}"
+            )
 
-    return idx
-
-
-async def resolve_entity(
-    client: TelegramClient,
-    ref: Union[int, str],
-    idx: dict,
-    label: str
-):
-    """
-    Resolve a chat/user/channel entity using the dialog index first (most reliable).
-    If not found, tries Telethon get_entity as fallback.
-    """
-    # 1) Try dialog index
-    if isinstance(ref, int):
-        key = str(ref)
-        if key in idx:
-            return idx[key].entity
-    else:
-        key = ref.lower()
-        if key in idx:
-            return idx[key].entity
-
-    # 2) Fallback: try Telethon resolution
+    # If it's a username, use get_entity(username)
     try:
-        return await client.get_entity(ref)
+        ent = await client.get_entity(chat_ref)
+        print(f"[RESOLVE] {label} resolved via username: @{chat_ref}")
+        return ent
     except Exception as e:
-        # Provide a very actionable error message
         raise RuntimeError(
-            f"Could not resolve {label}='{ref}'.\n"
-            f"Most common cause: the logged-in Telegram *user* (SESSION_STRING) "
-            f"is NOT a member of that private channel/chat, so Telethon can't see it.\n"
-            f"Fix: add that user account to the destination channel, then restart.\n"
-            f"Original error: {type(e).__name__}: {e}"
+            f"[RESOLVE-FAIL] Could not resolve {label} by username='@{chat_ref}'. "
+            f"Original error: {e}"
         )
 
 
-def safe_preview(text: str, limit: int = 180) -> str:
-    t = (text or "").replace("\n", " ").strip()
-    return t[:limit] + ("…" if len(t) > limit else "")
-
-
-# ----------------------------
-# Main
-# ----------------------------
 async def main():
-    # Required env vars
-    api_id = int(env_required("API_ID"))
-    api_hash = env_required("API_HASH")
-    session_string = env_required("SESSION_STRING")
+    API_ID = int(require_env("API_ID"))
+    API_HASH = require_env("API_HASH")
+    SESSION_STRING = require_env("SESSION_STRING")
 
-    source_raw = env_required("SOURCE_CHAT")   # e.g. @intellectia_1_bot_bot or numeric id
-    dest_raw = env_required("DEST_CHAT")       # e.g. -1003724596299 (DT Relay channel id)
+    SOURCE_CHAT_RAW = require_env("SOURCE_CHAT")      # e.g. "@intellectia_1_bot_bot"
+    DEST_CHAT_RAW = require_env("DEST_CHAT")          # e.g. "-1003724596299"
 
-    source_ref = parse_chat_ref(source_raw)
-    dest_ref = parse_chat_ref(dest_raw)
+    source_ref = parse_chat_ref(SOURCE_CHAT_RAW)
+    dest_ref = parse_chat_ref(DEST_CHAT_RAW)
 
-    log.info("Starting userbot...")
-    log.info(f"Listening for messages from: {source_raw}")
-    log.info(f"Forwarding to: {dest_raw}")
+    print("[BOOT] Starting userbot...")
+    print(f"[BOOT] SOURCE_CHAT={SOURCE_CHAT_RAW}")
+    print(f"[BOOT] DEST_CHAT={DEST_CHAT_RAW}")
 
-    client = TelegramClient(StringSession(session_string), api_id, api_hash)
+    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
-    await client.connect()
-    if not await client.is_user_authorized():
-        raise RuntimeError(
-            "Telethon session is not authorized. "
-            "You need to regenerate SESSION_STRING (logged in) and update Railway."
-        )
-
+    await client.start()
     me = await client.get_me()
-    log.info(f"Userbot connected as: {getattr(me, 'first_name', '')} {getattr(me, 'last_name', '')}".strip())
+    print(f"[BOOT] Logged in as: {getattr(me, 'first_name', '')} (id={me.id})")
+    print("[BOOT] Preloading dialogs...")
 
-    # IMPORTANT: build cache so ids like -100... resolve reliably
-    log.info("Building dialog cache (this can take a few seconds)...")
-    idx = await build_dialog_index(client)
-    log.info(f"Dialog cache built. Entries: {len(idx)}")
+    # Resolve source/dest entities *once*
+    source_entity = await resolve_entity(client, source_ref, "SOURCE_CHAT")
+    dest_entity = await resolve_entity(client, dest_ref, "DEST_CHAT")
 
-    # Resolve entities from cache
-    source_entity = await resolve_entity(client, source_ref, idx, "SOURCE_CHAT")
-    dest_entity = await resolve_entity(client, dest_ref, idx, "DEST_CHAT")
-
-    log.info("Resolved SOURCE_CHAT and DEST_CHAT successfully.")
-    log.info("Forwarder is live.")
+    print("[OK] Userbot connected.")
+    print(f"[OK] Listening for messages from: {SOURCE_CHAT_RAW}")
+    print(f"[OK] Forwarding to: {DEST_CHAT_RAW}")
 
     @client.on(events.NewMessage(chats=source_entity))
     async def handler(event):
         try:
-            msg = event.message
-            # Forward the entire message (keeps media/formatting)
-            await client.forward_messages(dest_entity, msg)
-            log.info(f"Forwarded: {safe_preview(msg.message)}")
+            # forward the exact message (keeps formatting/media)
+            await client.forward_messages(dest_entity, event.message)
+            print("[FORWARD] forwarded 1 message")
         except Exception as e:
-            log.exception(f"Forward failed: {type(e).__name__}: {e}")
+            print(f"[FORWARD-ERROR] {e}")
 
+    # Keep running forever
     await client.run_until_disconnected()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        sys.exit(0)
-    except Exception as e:
-        log.error(str(e))
-        raise
+    asyncio.run(main())
